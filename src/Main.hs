@@ -4,16 +4,12 @@ import Control.Exception (IOException, catch)
 import Control.Monad (when)
 
 import Data.Aeson
-import Data.Aeson.Encode.Pretty
 import qualified Data.ByteString.Lazy as LBS
 import Data.Either
 import Data.Maybe
 
-import qualified Network.Datadog as Datadog
-import qualified Network.Datadog.Monitor as Datadog.Monitor
-import qualified Network.Datadog.Types as Datadog.Types
-
-import Network.HTTP.Client (HttpException)
+import Network.HTTP.Client hiding (path)
+import Network.HTTP.Client.TLS (tlsManagerSettings)
 
 import Text.Printf (hPrintf)
 import Text.Regex.Base
@@ -23,6 +19,7 @@ import Options.Applicative
 
 import System.Directory
 import System.FilePath
+import System.Environment (getEnv)
 import System.Exit
 import System.IO
 
@@ -73,49 +70,48 @@ parser = info (helper <*> arguments)
          (progDesc "Synchronize between Datadog and the local filesystem")
 
 
--- LOCAL FILESYSTEM LOADING functions for loading resources
+-- LOCAL FILESYSTEM LOADING functions for loading monitors
 
-loadLocalConfigFromFile :: FilePath -> IO [Either String (FilePath,Resource)]
--- ^Blindly attempt to read a resource(s) from a file
+loadLocalConfigFromFile :: FilePath -> IO [Either String (FilePath,Monitor)]
+-- ^Blindly attempt to read a monitor(s) from a file
 loadLocalConfigFromFile path = do
   contents <- LBS.readFile path
-  let decodedSingle = (:[]) <$> eitherDecode contents :: Either String [Resource]
-  let decodedMulti = eitherDecode contents :: Either String [Resource]
-  let decoded = decodedSingle <|> decodedMulti <|> Left ("Could not decode to a resource: " ++ path)
+  let decodedSingle = (:[]) <$> eitherDecode contents :: Either String [Monitor]
+  let decodedMulti = eitherDecode contents :: Either String [Monitor]
+  let decodedSingleOld = (\(OldMonitor (DatadogMonitor m)) -> [m]) <$> eitherDecode contents
+  let decodedMultiOld = map (\(OldMonitor (DatadogMonitor m)) -> m) <$> eitherDecode contents
+  let decoded = decodedSingle <|> decodedMulti <|> decodedSingleOld <|> decodedMultiOld <|> Left ("Could not decode to a monitor: " ++ path)
   return $ either ((:[]) . Left) (map (\x -> Right (path,x))) decoded
 
-loadLocalConfigFromDir :: FilePath -> IO [Either String (FilePath,Resource)]
--- ^Blindly attempt to read a resource(s) from a directory
+loadLocalConfigFromDir :: FilePath -> IO [Either String (FilePath,Monitor)]
+-- ^Blindly attempt to read a monitor(s) from a directory
 loadLocalConfigFromDir path =
   ((concat <$>) . mapM loadLocalConfig) =<<
   map (path </>) <$>
   filter ((/='.') . head) <$>
   getDirectoryContents path
 
-loadLocalConfig :: FilePath -> IO [Either String (FilePath,Resource)]
--- ^Attempt to read a resource(s) from a path on the filesystem
+loadLocalConfig :: FilePath -> IO [Either String (FilePath,Monitor)]
+-- ^Attempt to read a monitor(s) from a path on the filesystem
 loadLocalConfig path =
   catch (loadLocalConfigFromFile path) $ exceptIO $
   catch (loadLocalConfigFromDir path) $ exceptIO $
   return [Left ("Cannot access file for reading: " ++ path)]
 
 
--- REMOTE DATADOG LOADING functions for loading resources from Datadog
+-- REMOTE DATADOG LOADING functions for loading monitors from Datadog
 
-loadRemoteMonitors :: Datadog.Types.Environment -> Maybe Datadog.Monitor.MonitorId -> IO [(Int,Resource)]
--- ^Attempt to load a monitor(s) from Datadog
-loadRemoteMonitors env mId =
-  map (\m -> (Datadog.Monitor.monitorId' m,Monitor (Datadog.Monitor.monitorSpec m))) <$>
-  maybe loadAll loadOne mId
-  where loadOne = fmap (:[]) . Datadog.Monitor.loadMonitor env
-        loadAll = Datadog.Monitor.loadMonitors env []
+loadRemoteMonitors :: Manager -> (String,String) -> Maybe Int -> IO [(Int,Monitor)]
+loadRemoteMonitors manager (api,app) = maybe loadAll loadOne
+  where loadOne = fmap (:[]) . getFromDatadog manager (api,app)
+        loadAll = getAllFromDatadog manager (api,app)
 
-loadRemoteConfig :: Datadog.Types.Environment -> String -> IO [Either String (Int,Resource)]
--- ^Attempt to load a resource(s) based on a Datadog URL
-loadRemoteConfig env url
+loadRemoteConfig :: Manager -> (String,String) -> String -> IO [Either String (Int,Monitor)]
+-- ^Attempt to load a monitor(s) based on a Datadog URL
+loadRemoteConfig manager (api,app) url
   | url =~ "monitors" =
       let monitorId = fmap read $ listToMaybe $ mrSubList (url =~ "monitors#([0-9]+)")
-      in catch (map Right <$> loadRemoteMonitors env monitorId)
+      in catch (map Right <$> loadRemoteMonitors manager (api,app) monitorId)
          -- Only catch HttpExceptions by using a type cast
          (\e -> return [Left ("Failure loading " ++ url ++ ": " ++ show (e :: HttpException))])
   | otherwise = return [Left ("Could not determine resource for " ++ url)]
@@ -123,20 +119,20 @@ loadRemoteConfig env url
 
 -- LOADING FUNCTIONS
 
-gatherResources :: Datadog.Types.Environment -> [FilePath] -> [String] -> IO ([(String,Resource)],[(Int,Resource)])
--- ^Attempt to collect all the resources from the local filesystem and Datadog
-gatherResources env localPaths remoteURLs = do
-  (localErrors, localResources) <- (partitionEithers . concat) <$>
-                                   mapM loadLocalConfig localPaths
+gatherMonitors :: Manager -> (String,String) -> [FilePath] -> [String] -> IO ([(String,Monitor)],[(Int,Monitor)])
+-- ^Attempt to collect all the monitors from the local filesystem and Datadog
+gatherMonitors manager (api,app) localPaths remoteURLs = do
+  (localErrors, localMonitors) <- (partitionEithers . concat) <$>
+                                  mapM loadLocalConfig localPaths
   mapM_ (hPutStrLn stderr . ("WARNING: "++)) localErrors
-  (remoteErrors, remoteResources) <- (partitionEithers . concat) <$>
-                                     mapM (loadRemoteConfig env) remoteURLs
+  (remoteErrors, remoteMonitors) <- (partitionEithers . concat) <$>
+                                    mapM (loadRemoteConfig manager (api,app)) remoteURLs
   mapM_ (hPutStrLn stderr . ("WARNING: "++)) remoteErrors
-  let similarLocal = pairSimilar localResources
-  let similarRemote = pairSimilar remoteResources
+  let similarLocal = pairSimilar localMonitors
+  let similarRemote = pairSimilar remoteMonitors
   mapM_ (\((ia,ra),(ib,rb)) ->
           hPrintf stderr
-          "ERROR: Resource %s in file %s duplicates resource %s in file %s\n"
+          "ERROR: Monitor %s in file %s duplicates monitor %s in file %s\n"
           (show ra)
           ia
           (show rb)
@@ -144,123 +140,129 @@ gatherResources env localPaths remoteURLs = do
         ) similarLocal
   mapM_ (\((ia,ra),(ib,rb)) ->
           hPrintf stderr
-          "ERROR: Resource %s (%s) duplicates resource %s (%s)\n"
+          "ERROR: Monitor %s (%s) duplicates monitor %s (%s)\n"
           (show ia)
           (show ra)
           (show ib)
           (show rb)
         ) similarRemote
   when (length similarLocal + length similarRemote > 0) exitFailure
-  return (localResources, remoteResources)
+  return (localMonitors, remoteMonitors)
 
 
--- LOCAL FILESYSTEM SAVING functions for saving resources
+-- LOCAL FILESYSTEM SAVING functions for saving monitors
 
-writeToPathFileDry :: FilePath -> (Maybe Int,Resource) -> IO ()
--- ^Simulate a successful resource file write
+writeToPathFileDry :: FilePath -> (Maybe Int,Monitor) -> IO ()
+-- ^Simulate a successful monitor file write
 writeToPathFileDry _ (Nothing,_) = return ()
-writeToPathFileDry path (Just c,resource) =
+writeToPathFileDry path (Just c,monitor) =
   hPrintf stdout
-  "INFO: Would have written resource %s (%d) to file: %s\n"
-  (show resource) c path
+  "INFO: Would have written monitor %s (%d) to file: %s\n"
+  (show monitor) c path
 
-writeToPathDirDry :: FilePath -> (Maybe Int,Resource) -> IO ()
--- ^Simulate a successful resource directory write
+writeToPathDirDry :: FilePath -> (Maybe Int,Monitor) -> IO ()
+-- ^Simulate a successful monitor directory write
 writeToPathDirDry _ (Nothing,_) = return ()
-writeToPathDirDry path (Just c,resource) =
+writeToPathDirDry path (Just c,monitor) =
   hPrintf stdout
-  "INFO: Would have written resource %s (%d) to new file in directory: %s\n"
-  (show resource) c path
+  "INFO: Would have written monitor %s (%d) to new file in directory: %s\n"
+  (show monitor) c path
 
-writeToPathsDry :: [(String,[(Maybe Int,Resource)])] -> IO Bool
--- ^Simulate writing resources to their respective files
+writeToPathsDry :: [(String,[(Maybe Int,Monitor)])] -> IO Bool
+-- ^Simulate writing monitors to their respective files
 writeToPathsDry [] = return True
 writeToPathsDry ((_,[]):xs) = writeToPathsDry xs
-writeToPathsDry ((path,resources):xs) = do
+writeToPathsDry ((path,monitors):xs) = do
   isDir <- doesDirectoryExist path
-  mapM_ ((if isDir then writeToPathDirDry else writeToPathFileDry) path) resources
+  mapM_ ((if isDir then writeToPathDirDry else writeToPathFileDry) path) monitors
   writeToPathsDry xs
 
-writeToPathFile :: FilePath -> [(Maybe Int, Resource)] -> IO ()
--- ^Attempt to write resources to a file
+writeToPathFile :: FilePath -> [(Maybe Int, Monitor)] -> IO ()
+-- ^Attempt to write monitors to a file
 -- May raise IOException
-writeToPathFile path resources = do
-  let bytes = if length resources > 1
-              then encodePretty $ map snd resources
-              else encodePretty $ head $ map snd resources
+writeToPathFile path monitors = do
+  let bytes = encodePrettyMonitor $ map snd monitors
   LBS.writeFile path (LBS.snoc bytes 10) -- append newline ('\n')
-  let message = "INFO: Resource %s (%s) written to %s\n"
-  mapM_ (\(mi,r) -> maybe (return ()) (\i -> hPrintf stdout message (show i) (show r) path) mi) resources
+  let message = "INFO: Monitor %s (%s) written to %s\n"
+  mapM_ (\(mi,r) -> maybe (return ()) (\i -> hPrintf stdout message (show i) (show r) path) mi) monitors
 
-writeToPathDir :: FilePath -> [(Maybe Int, Resource)] -> IO Bool
--- ^Attempt to write resources each to their own file within a directory
-writeToPathDir path resources = do
-  let actionable = filter (isJust . fst) resources
+writeToPathDir :: FilePath -> [(Maybe Int, Monitor)] -> IO Bool
+-- ^Attempt to write monitors each to their own file within a directory
+writeToPathDir path monitors = do
+  let actionable = filter (isJust . fst) monitors
   let tryFile (c,(mi,r)) = let fpath = path </> c <.> "json"
                            in catch (writeToPathFile fpath [(mi,r)] >> return True)
                               (exceptIO (hPutStrLn stderr ("ERROR: Could not write to file: " ++ fpath) >> return False))
   fmap and $ mapM tryFile $ zip (map show [(1::Int)..]) actionable
 
-writeToPaths :: [(String,[(Maybe Int, Resource)])] -> IO Bool
--- ^Attempt to write resources to their respective files
+writeToPaths :: [(String,[(Maybe Int, Monitor)])] -> IO Bool
+-- ^Attempt to write monitors to their respective files
 writeToPaths [] = return True
 writeToPaths ((_,[]):xs) = writeToPaths xs
-writeToPaths ((path,resources):xs) = do
-  let tryFile = catch (writeToPathFile path resources >> return True)
-  let tryDir = catch (writeToPathDir path resources)
+writeToPaths ((path,monitors):xs) = do
+  let tryFile = catch (writeToPathFile path monitors >> return True)
+  let tryDir = catch (writeToPathDir path monitors)
   -- Only catch IOExceptions by using a type cast
   success <- tryFile $ exceptIO $ tryDir $ exceptIO (hPutStrLn stderr ("ERROR: Could not write to path: " ++ path) >> return False)
   (success &&) <$> writeToPaths xs
 
 
--- REMOTE DATADOG SAVING functions for saving resources
+-- REMOTE DATADOG SAVING functions for saving monitors
 
-writeToDatadogDry :: [(Maybe Int,(FilePath,Resource))] -> IO Bool
--- ^Simulate writing resources to Datadog
+writeToDatadogDry :: [(Maybe Int,(FilePath,Monitor))] -> IO Bool
+-- ^Simulate writing monitors to Datadog
 writeToDatadogDry [] = return True
-writeToDatadogDry ((mc,(path,resource)):xs) = do
+writeToDatadogDry ((mc,(path,monitor)):xs) = do
   let createMessage = hPrintf stdout
-                      "INFO: Would have created new resource %s from %s in Datadog\n"
-                      (show resource) path
+                      "INFO: Would have created new monitor %s from %s in Datadog\n"
+                      (show monitor) path
   let updateMessage c = hPrintf stdout
-                        "INFO: Would have updated Datadog ID %d with resource %s from %s\n"
-                        c (show resource) path
+                        "INFO: Would have updated Datadog ID %d with monitor %s from %s\n"
+                        c (show monitor) path
   maybe createMessage updateMessage mc
   writeToDatadogDry xs
 
-writeToDatadog :: Datadog.Types.Environment -> [(Maybe Int,(FilePath,Resource))] -> IO Bool
--- ^Attempt to write resources to Datadog
-writeToDatadog _ [] = return True
-writeToDatadog env ((mc,(path,resource)):xs) = do
+writeToDatadog :: Manager -> (String,String) -> [(Maybe Int,(FilePath,Monitor))] -> IO Bool
+-- ^Attempt to write monitors to Datadog
+writeToDatadog _ _ [] = return True
+writeToDatadog manager (api,app) ((mc,(path,monitor)):xs) = do
   let createMessage = hPrintf stdout
-                      "INFO: Created new resource %s from %s as %d in Datadog\n"
-                      (show resource) path
+                      "INFO: Created new monitor %s from %s as %d in Datadog\n"
+                      (show monitor) path
   let updateMessage c = hPrintf stdout
-                        "INFO: Updated Datadog ID %d with resource %s from %s\n"
-                        c (show resource) path
+                        "INFO: Updated Datadog ID %d with monitor %s from %s\n"
+                        c (show monitor) path
   let message = if isNothing mc then createMessage else updateMessage
   let errorMessage e = hPrintf stderr
-                       "ERROR: Could not send resource %s from %s to Datadog: %s\n"
-                       (show resource) path (show (e :: HttpException))
-  success <- catch (sendToDatadog env mc resource >>= message >> return True)
+                       "ERROR: Could not send monitor %s from %s to Datadog: %s\n"
+                       (show monitor) path (show (e :: HttpException))
+  success <- catch (sendToDatadog manager (api,app) mc monitor >>= message >> return True)
              (\e -> errorMessage e >> return False)
-  (success &&) <$> writeToDatadog env xs
+  (success &&) <$> writeToDatadog manager (api,app) xs
 
 
 -- MAIN
 
+loadKeysFromEnv :: IO (String,String)
+loadKeysFromEnv = do
+  api <- getEnv "DATADOG_API_KEY"
+  app <- getEnv "DATADOG_APP_KEY"
+  return (api,app)
+
 run :: Arguments -> IO Bool
 run (Arguments dryrun (SaveCommand localPath remoteURLs)) = do
-  env <- Datadog.loadKeysFromEnv >>= Datadog.createEnvironment
-  (localResources, remoteResources) <- gatherResources env [localPath] remoteURLs
-  let actions = groupToFilePath localPath remoteResources localResources
+  manager <- newManager tlsManagerSettings
+  apiapp <- loadKeysFromEnv
+  (localMonitors, remoteMonitors) <- gatherMonitors manager apiapp [localPath] remoteURLs
+  let actions = groupToFilePath localPath remoteMonitors localMonitors
   (if dryrun then writeToPathsDry else writeToPaths) actions
 run (Arguments dryrun (LoadCommand localPaths)) = do
-  env <- Datadog.loadKeysFromEnv >>= Datadog.createEnvironment
+  manager <- newManager tlsManagerSettings
+  apiapp <- loadKeysFromEnv
   let allRemoteURLs = ["monitors"]
-  (localResources, remoteResources) <- gatherResources env localPaths allRemoteURLs
-  let actions = groupToRemote localResources remoteResources
-  (if dryrun then writeToDatadogDry else writeToDatadog env) actions
+  (localMonitors, remoteMonitors) <- gatherMonitors manager apiapp localPaths allRemoteURLs
+  let actions = groupToRemote localMonitors remoteMonitors
+  (if dryrun then writeToDatadogDry else writeToDatadog manager apiapp) actions
 
 
 main :: IO ()
