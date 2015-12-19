@@ -42,14 +42,14 @@ Available commands:
 ### Save
 
 ```
-Usage: datadog-petshop save DEST URL...
+Usage: datadog-petshop save DEST [ID...]
   Sync Datadog configurations to the local filesystem
 
 Available options:
   -h,--help                Show this help text
   DEST                     File/Directory in which to store configuration
-  URL...                   Endpoint from which to pull configuration
-  ```
+  ID...                    Datadog metric ID from which to pull configuration
+```
 
 ### Load
 

@@ -1,7 +1,7 @@
 module Main (main) where
 
 import Control.Exception (IOException, catch)
-import Control.Monad (when)
+import Control.Monad (unless, when)
 
 import Data.Aeson
 import qualified Data.ByteString.Lazy as LBS
@@ -13,8 +13,6 @@ import Network.HTTP.Client hiding (path)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 
 import Text.Printf (hPrintf)
-import Text.Regex.Base
-import Text.Regex.TDFA
 
 import Options.Applicative
 
@@ -36,7 +34,7 @@ exceptIO = const
 
 data Arguments = Arguments Bool Command
 
-data Command = SaveCommand String [String]
+data Command = SaveCommand String [Int]
              | LoadCommand [String]
 
 saveCommand :: Parser Command
@@ -45,9 +43,9 @@ saveCommand =
   strArgument (metavar "DEST" <>
                help "File/Directory in which to store configuration"
               ) <*>
-  some (strArgument (metavar "URL..." <>
-                     help "Endpoint from which to pull configuration"
-                    ))
+  many (argument auto (metavar "ID..." <>
+                       help "Datadog monitor ID from which to pull configuration"
+                      ))
 
 loadCommand :: Parser Command
 loadCommand =
@@ -109,28 +107,29 @@ loadRemoteMonitors manager (api,app) = maybe loadAll loadOne
   where loadOne = fmap (:[]) . getFromDatadog manager (api,app)
         loadAll = getAllFromDatadog manager (api,app)
 
-loadRemoteConfig :: Manager -> (String,String) -> String -> IO [Either String (Int,Monitor)]
--- ^Attempt to load a monitor(s) based on a Datadog URL
-loadRemoteConfig manager (api,app) url
-  | url =~ "monitors" =
-      let monitorId = fmap read $ listToMaybe $ mrSubList (url =~ "monitors#([0-9]+)")
-      in catch (map Right <$> loadRemoteMonitors manager (api,app) monitorId)
-         -- Only catch HttpExceptions by using a type cast
-         (\e -> return [Left ("Failure loading " ++ url ++ ": " ++ show (e :: HttpException))])
-  | otherwise = return [Left ("Could not determine resource for " ++ url)]
-
+loadRemoteConfig :: Manager -> (String,String) -> [Int] -> IO (Either String [(Int,Monitor)])
+-- ^Attempt to load monitors
+loadRemoteConfig manager (api,app) [] =
+  catch (Right <$> loadRemoteMonitors manager (api,app) Nothing)
+  (\e -> return (Left ("Failure loading all monitors: " ++ show (e :: HttpException))))
+loadRemoteConfig manager (api,app) [x] =
+  catch (Right <$> loadRemoteMonitors manager (api,app) (Just x))
+  (\e -> return (Left ("Failure loading all monitors: " ++ show (e :: HttpException))))
+loadRemoteConfig manager (api,app) xs = do
+  lrs <- mapM (\x -> catch (Right <$> loadRemoteMonitors manager (api,app) (Just x))
+                     (\e -> return (Left ("Failure loading monitor " ++ show x ++ ": " ++ show (e :: HttpException))))) xs
+  return (concat <$> sequence lrs)
 
 -- LOADING FUNCTIONS
 
-gatherMonitors :: Manager -> (String,String) -> [FilePath] -> [String] -> IO ([(String,Monitor)],[(Int,Monitor)])
+gatherMonitors :: Manager -> (String,String) -> [FilePath] -> [Int] -> IO ([(String,Monitor)],[(Int,Monitor)])
 -- ^Attempt to collect all the monitors from the local filesystem and Datadog
-gatherMonitors manager (api,app) localPaths remoteURLs = do
+gatherMonitors manager (api,app) localPaths remoteIDs = do
   (localErrors, localMonitors) <- (partitionEithers . concat) <$>
                                   mapM loadLocalConfig localPaths
-  mapM_ (hPutStrLn stderr . ("ERROR: "++)) localErrors
-  (remoteErrors, remoteMonitors) <- (partitionEithers . concat) <$>
-                                    mapM (loadRemoteConfig manager (api,app)) remoteURLs
-  mapM_ (hPutStrLn stderr . ("ERROR: "++)) remoteErrors
+  unless (null localErrors) (mapM_ (hPutStrLn stderr . ("ERROR: "++)) localErrors >> exitFailure)
+  remoteMonitors <- either (\l -> hPutStrLn stderr ("ERROR: " ++ l) >> exitFailure) return =<<
+                    loadRemoteConfig manager (api,app) remoteIDs
   let similarLocal = pairSimilar localMonitors
   let similarRemote = pairSimilar remoteMonitors
   mapM_ (\((ia,ra),(ib,rb)) ->
@@ -150,7 +149,6 @@ gatherMonitors manager (api,app) localPaths remoteURLs = do
           (show rb)
         ) similarRemote
   when (length similarLocal + length similarRemote > 0) exitFailure
-  when (length localErrors + length remoteErrors > 0) exitFailure
   return (localMonitors, remoteMonitors)
 
 
@@ -254,17 +252,17 @@ loadKeysFromEnv = do
   return (api,app)
 
 run :: Arguments -> IO Bool
-run (Arguments dryrun (SaveCommand localPath remoteURLs)) = do
+run (Arguments dryrun (SaveCommand localPath remoteIDs)) = do
   manager <- newManager tlsManagerSettings
   apiapp <- loadKeysFromEnv
-  (localMonitors, remoteMonitors) <- gatherMonitors manager apiapp [localPath] remoteURLs
+  (localMonitors, remoteMonitors) <- gatherMonitors manager apiapp [localPath] remoteIDs
   let actions = groupToFilePath localPath remoteMonitors localMonitors
   (if dryrun then writeToPathsDry else writeToPaths) actions
 run (Arguments dryrun (LoadCommand localPaths)) = do
   manager <- newManager tlsManagerSettings
   apiapp <- loadKeysFromEnv
-  let allRemoteURLs = ["monitors"]
-  (localMonitors, remoteMonitors) <- gatherMonitors manager apiapp localPaths allRemoteURLs
+  let allRemoteIDs = []
+  (localMonitors, remoteMonitors) <- gatherMonitors manager apiapp localPaths allRemoteIDs
   let actions = groupToRemote localMonitors remoteMonitors
   (if dryrun then writeToDatadogDry else writeToDatadog manager apiapp) actions
 
