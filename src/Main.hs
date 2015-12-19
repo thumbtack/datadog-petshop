@@ -6,6 +6,7 @@ import Control.Monad (when)
 import Data.Aeson
 import qualified Data.ByteString.Lazy as LBS
 import Data.Either
+import Data.List (isSuffixOf)
 import Data.Maybe
 
 import Network.HTTP.Client hiding (path)
@@ -81,7 +82,9 @@ loadLocalConfigFromFile path = do
   let decodedSingleOld = (\(OldMonitor (DatadogMonitor m)) -> [m]) <$> eitherDecode contents
   let decodedMultiOld = map (\(OldMonitor (DatadogMonitor m)) -> m) <$> eitherDecode contents
   let decoded = decodedSingle <|> decodedMulti <|> decodedSingleOld <|> decodedMultiOld <|> Left ("Could not decode to a monitor: " ++ path)
-  return $ either ((:[]) . Left) (map (\x -> Right (path,x))) decoded
+  return $ if ".json" `isSuffixOf` path
+           then either ((:[]) . Left) (map (\x -> Right (path,x))) decoded
+           else []
 
 loadLocalConfigFromDir :: FilePath -> IO [Either String (FilePath,Monitor)]
 -- ^Blindly attempt to read a monitor(s) from a directory
@@ -124,10 +127,10 @@ gatherMonitors :: Manager -> (String,String) -> [FilePath] -> [String] -> IO ([(
 gatherMonitors manager (api,app) localPaths remoteURLs = do
   (localErrors, localMonitors) <- (partitionEithers . concat) <$>
                                   mapM loadLocalConfig localPaths
-  mapM_ (hPutStrLn stderr . ("WARNING: "++)) localErrors
+  mapM_ (hPutStrLn stderr . ("ERROR: "++)) localErrors
   (remoteErrors, remoteMonitors) <- (partitionEithers . concat) <$>
                                     mapM (loadRemoteConfig manager (api,app)) remoteURLs
-  mapM_ (hPutStrLn stderr . ("WARNING: "++)) remoteErrors
+  mapM_ (hPutStrLn stderr . ("ERROR: "++)) remoteErrors
   let similarLocal = pairSimilar localMonitors
   let similarRemote = pairSimilar remoteMonitors
   mapM_ (\((ia,ra),(ib,rb)) ->
@@ -147,6 +150,7 @@ gatherMonitors manager (api,app) localPaths remoteURLs = do
           (show rb)
         ) similarRemote
   when (length similarLocal + length similarRemote > 0) exitFailure
+  when (length localErrors + length remoteErrors > 0) exitFailure
   return (localMonitors, remoteMonitors)
 
 
