@@ -12,12 +12,6 @@ Currently, Datadog monitors are supported.
 
 ## Building
 
-**WARNING:** The current release of the `datadog` on Hackage is not up-to-date
-and will not allow this tool to be built. Please use a build of the library
-from git using
-[commit `cf4d2da`](https://github.com/iand675/datadog/commit/cf4d2da8f6917bcd5009061208acd1fc68267f91)
-or later.
-
 `datadog-petshop` can be built and installed like any other cabal package.
 
 ## Usage
