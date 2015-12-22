@@ -91,7 +91,7 @@ instance ToJSON DatadogMonitor where
             | T.isSuffixOf "count_by_status()" (monitorQuery m) = "service check"
             | otherwise = "metric alert"
           options = object ["timeout_h" .= monitorTimeoutHours m
-                           ,"no_data_timeframe" .= min 2 (monitorNoDataTimeframe m)
+                           ,"no_data_timeframe" .= max 2 (monitorNoDataTimeframe m)
                            ,"notify_no_data" .= (monitorNoDataTimeframe m > 0)
                            ,"renotify_interval" .= monitorRenotifyInterval m
                            ,"notify_audit" .= False
