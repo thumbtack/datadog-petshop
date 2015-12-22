@@ -13,6 +13,7 @@ module Resource
 , isUpdate
 , groupToFilePath
 , groupToRemote
+, groupToForce
 ) where
 
 import Control.Exception (AssertionFailed(..), assert, throwIO)
@@ -219,7 +220,15 @@ groupToFilePath path incoming outgoing =
 
 
 groupToRemote :: [(FilePath,Monitor)] -> [(Int,Monitor)] -> [(Maybe Int,(FilePath,Monitor))]
+-- ^Group filepath monitors by their remote counterparts, removing duplicates
 groupToRemote local remote =
   map (\(p,l) -> (fst <$> findUpdate l remote,(p,l))) $
   -- remove the ones that already exist (waste of time to update them)
   filter (\(_,l) -> all ((l/=) . snd) remote) local
+
+
+groupToForce :: [(FilePath,Monitor)] -> [(Int,Monitor)] -> [(Maybe Int,(FilePath,Monitor))]
+-- ^Group filepath monitors by their remote counterparts
+groupToForce local remote =
+  map (\(p,l) -> (fst <$> findSimilar l remote,(p,l))) local
+  where findSimilar resource = listToMaybe . filter (isSimilar resource . snd)

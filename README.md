@@ -54,10 +54,11 @@ Available options:
 ### Load
 
 ```
-Usage: datadog-petshop load SOURCE...
+Usage: datadog-petshop load [-f|--force] SOURCE...
   Sync local filesystem configurations to Datadog
 
 Available options:
   -h,--help                Show this help text
+  -f,--force               Update monitors regardless of update status
   SOURCE...                File/Directory from which to read configuration
 ```

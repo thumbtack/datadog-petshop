@@ -35,7 +35,7 @@ exceptIO = const
 data Arguments = Arguments Bool Command
 
 data Command = SaveCommand String [Int]
-             | LoadCommand [String]
+             | LoadCommand Bool [String]
 
 saveCommand :: Parser Command
 saveCommand =
@@ -50,6 +50,7 @@ saveCommand =
 loadCommand :: Parser Command
 loadCommand =
   LoadCommand <$>
+  switch (long "force" <> short 'f' <> help "Update monitors regardless of update status") <*>
   some (strArgument (metavar "SOURCE..." <>
                      help "File/Directory from which to read configuration"
                     ))
@@ -258,12 +259,12 @@ run (Arguments dryrun (SaveCommand localPath remoteIDs)) = do
   (localMonitors, remoteMonitors) <- gatherMonitors manager apiapp [localPath] remoteIDs
   let actions = groupToFilePath localPath remoteMonitors localMonitors
   (if dryrun then writeToPathsDry else writeToPaths) actions
-run (Arguments dryrun (LoadCommand localPaths)) = do
+run (Arguments dryrun (LoadCommand force localPaths)) = do
   manager <- newManager tlsManagerSettings
   apiapp <- loadKeysFromEnv
   let allRemoteIDs = []
   (localMonitors, remoteMonitors) <- gatherMonitors manager apiapp localPaths allRemoteIDs
-  let actions = groupToRemote localMonitors remoteMonitors
+  let actions = (if force then groupToForce else groupToRemote) localMonitors remoteMonitors
   (if dryrun then writeToDatadogDry else writeToDatadog manager apiapp) actions
 
 
