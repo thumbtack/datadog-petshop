@@ -1,5 +1,6 @@
 module Main (main) where
 
+import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, catch)
 import Control.Monad (unless, when)
 
@@ -227,8 +228,11 @@ writeToDatadogDry ((mc,(path,monitor)):xs) = do
 
 writeToDatadog :: Manager -> (String,String) -> [(Maybe Int,(FilePath,Monitor))] -> IO Bool
 -- ^Attempt to write monitors to Datadog
-writeToDatadog _ _ [] = return True
-writeToDatadog manager (api,app) ((mc,(path,monitor)):xs) = do
+writeToDatadog manager (api,app) xs = writeToDatadogBackoff manager (api,app) xs 1
+
+writeToDatadogBackoff :: Manager -> (String,String) -> [(Maybe Int,(FilePath,Monitor))] -> Int -> IO Bool
+writeToDatadogBackoff _ _ [] _ = return True
+writeToDatadogBackoff manager (api,app) ((mc,(path,monitor)):xs) wait = do
   let createMessage = hPrintf stdout
                       "INFO: Created new monitor %s from %s as %d in Datadog\n"
                       (show monitor) path
@@ -240,7 +244,9 @@ writeToDatadog manager (api,app) ((mc,(path,monitor)):xs) = do
                        "ERROR: Could not send monitor %s from %s to Datadog: %s\n"
                        (show monitor) path (show (e :: HttpException))
   success <- catch (sendToDatadog manager (api,app) mc monitor >>= message >> return True)
-             (\e -> errorMessage e >> return False)
+             (\e -> if wait < 4
+                    then (threadDelay (wait * 256000) >> writeToDatadogBackoff manager (api,app) ((mc,(path,monitor)):xs) (wait + 1))
+                    else (errorMessage e >> return False))
   (success &&) <$> writeToDatadog manager (api,app) xs
 
 
