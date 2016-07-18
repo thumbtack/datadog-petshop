@@ -17,7 +17,7 @@ module Resource
 ) where
 
 import Control.Exception (AssertionFailed(..), assert, throwIO)
-import Control.Monad (liftM2)
+import Control.Monad (liftM2, mplus)
 
 import Data.Aeson
 import Data.Aeson.Encode.Pretty
@@ -25,14 +25,22 @@ import Data.Aeson.Types
 import Data.ByteString.Lazy (ByteString)
 import qualified Data.Map as Map
 import Data.Maybe
+import Data.Scientific (floatingOrInteger)
 import qualified Data.Text as T
 import Data.Text.Encoding (encodeUtf8)
+import Data.Text.Lazy.Builder (fromString)
 
 import Network.HTTP.Client hiding (path)
+
+import Numeric (showFFloat)
+
+import Text.Read (readMaybe)
 
 
 data Monitor = Monitor { monitorName :: T.Text
                        , monitorQuery :: T.Text
+                       , monitorThresholdAlert :: Maybe Double
+                       , monitorThresholdWarn :: Maybe Double
                        , monitorMessage :: T.Text
                        , monitorNoDataTimeframe :: Integer
                        , monitorTimeoutHours :: Integer
@@ -42,26 +50,37 @@ data Monitor = Monitor { monitorName :: T.Text
 instance Show Monitor where
   show m = "\"" ++ T.unpack (monitorName m) ++ "\""
 
+queryHasThreshold :: T.Text -> Bool
+queryHasThreshold = not . T.isSuffixOf "by_status()"
+
 instance ToJSON Monitor where
-  toJSON m = object ["name" .= monitorName m
-                    ,"query" .= monitorQuery m
-                    ,"message" .= monitorMessage m
-                    ,"no_data_timeframe" .= if monitorNoDataTimeframe m > 0
-                                            then Number (fromIntegral (monitorNoDataTimeframe m))
-                                            else Null
-                    ,"timeout_hours" .= if monitorTimeoutHours m > 0
-                                        then Number (fromIntegral (monitorTimeoutHours m))
-                                        else Null
-                    ,"renotify_interval" .= if monitorRenotifyInterval m > 0
-                                            then Number (fromIntegral (monitorRenotifyInterval m))
-                                            else Null
-                    ]
+  toJSON m = object $ ["name" .= monitorName m
+                      ,"query" .= monitorQuery m
+                      ,"message" .= monitorMessage m
+                      ,"no_data_timeframe" .= if monitorNoDataTimeframe m > 0
+                                              then Number (fromIntegral (monitorNoDataTimeframe m))
+                                              else Null
+                      ,"timeout_hours" .= if monitorTimeoutHours m > 0
+                                          then Number (fromIntegral (monitorTimeoutHours m))
+                                          else Null
+                      ,"renotify_interval" .= if monitorRenotifyInterval m > 0
+                                              then Number (fromIntegral (monitorRenotifyInterval m))
+                                              else Null
+                      ] ++
+                      thresholdAlert ++
+                      thresholdWarn
+    where thresholdWarn = maybe [] (\t -> ["threshold_warn" .= Number (realToFrac t)]) (monitorThresholdWarn m)
+          thresholdAlertData = maybe [] (\t -> ["threshold_alert" .= Number (realToFrac t)]) (monitorThresholdAlert m)
+          -- if there's a warn threshold, there has to be an alert threshold
+          thresholdAlert = if queryHasThreshold (monitorQuery m) && null thresholdWarn then [] else thresholdAlertData
 
 instance FromJSON Monitor where
   parseJSON (Object v) = modifyFailure ("Could not decode as a monitor: " ++) $
                          Monitor <$>
                          v .: "name" <*>
                          v .: "query" <*>
+                         v .:? "threshold_alert" .!= Nothing <*>
+                         v .:? "threshold_warn" .!= Nothing <*>
                          v .: "message" <*>
                          v .:? "no_data_timeframe" .!= 0 <*>
                          v .:? "timeout_hours" .!= 0 <*>
@@ -69,13 +88,22 @@ instance FromJSON Monitor where
   parseJSON _ = fail "Could not decode as a monitor"
 
 encodePrettyMonitor :: ToJSON a => a -> ByteString
-encodePrettyMonitor = encodePretty' (defConfig { confCompare = keyOrder order })
+encodePrettyMonitor = encodePretty' config
   where order = ["name"
                 ,"query"
+                ,"threshold_alert"
+                ,"threshold_warn"
                 ,"message"
                 ,"no_data_timeframe"
                 ,"timeout_hours"
                 ,"renotify_interval"]
+        -- custom display function to avoid unnecessary decimals (not user-friendly)
+        displayNumber = fromString . either (\f -> showFFloat Nothing (f :: Double) "") (\i -> show (i :: Integer)) . floatingOrInteger
+        config = defConfig { confCompare = keyOrder order
+                           , confNumFormat = Custom displayNumber }
+
+parseStrNum :: T.Text -> Object -> Parser (Maybe Double)
+parseStrNum k v = (withText "" (\s -> maybe (fail "") (return . Just) (readMaybe (T.unpack s) :: Maybe Double)) =<< (v .: k)) `mplus` (v .:? k .!= Nothing)
 
 newtype DatadogMonitor = DatadogMonitor Monitor
 
@@ -88,15 +116,18 @@ instance ToJSON DatadogMonitor where
                                      ]
     where kind
             | T.isPrefixOf "events(" (monitorQuery m) = "event alert"
-            | T.isSuffixOf "count_by_status()" (monitorQuery m) = "service check"
+            | T.isSuffixOf "by_status()" (monitorQuery m) = "service check"
             | otherwise = "metric alert"
-          options = object ["timeout_h" .= monitorTimeoutHours m
-                           ,"no_data_timeframe" .= max 2 (monitorNoDataTimeframe m)
-                           ,"notify_no_data" .= (monitorNoDataTimeframe m > 0)
-                           ,"renotify_interval" .= monitorRenotifyInterval m
-                           ,"notify_audit" .= False
-                           ,"escalation_message" .= ("" :: T.Text)
-                           ]
+          threshold = case (monitorThresholdAlert m, monitorThresholdWarn m) of
+            (Just a, Just w) -> Just $ object ["critical" .= a, "warning" .= w]
+            _ -> Nothing
+          options = object $ ["timeout_h" .= monitorTimeoutHours m
+                             ,"no_data_timeframe" .= max 2 (monitorNoDataTimeframe m)
+                             ,"notify_no_data" .= (monitorNoDataTimeframe m > 0)
+                             ,"renotify_interval" .= monitorRenotifyInterval m
+                             ,"notify_audit" .= False
+                             ,"escalation_message" .= ("" :: T.Text)
+                             ] ++ maybe [] (\t -> ["thresholds" .= t]) threshold
 
 instance FromJSON DatadogMonitor where
   parseJSON (Object v) = modifyFailure ("Could not decode as a monitor: " ++) $
@@ -104,6 +135,9 @@ instance FromJSON DatadogMonitor where
                          (Monitor <$>
                           v .:? "name" .!= "" <*>
                           v .: "query" <*>
+                          -- handle thresholds being strings instead of ints sometimes (WTF Datadog)
+                          tre (parseStrNum "critical") <*>
+                          tre (parseStrNum "warning") <*>
                           v .:? "message" .!= "" <*>
                           liftM2 (\b n -> if b then n else 0) nnd ndt <*>
                           opt (\w -> w .:? "timeout_h" .!= 0) <*>
@@ -111,6 +145,7 @@ instance FromJSON DatadogMonitor where
     where opt f = (v .: "options") >>= withObject "" f
           nnd = opt (\w -> w .:? "notify_no_data" .!= False)
           ndt = opt (\w -> w .:? "no_data_timeframe" .!= 0)
+          tre f = opt (\w -> (w .:? "thresholds" .!= object []) >>= withObject "" f)
   parseJSON _ = fail "Could not decode as a monitor"
 
 newtype OldMonitor = OldMonitor DatadogMonitor
